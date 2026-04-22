@@ -14,6 +14,10 @@ import {
   BookOpen, 
   Sparkles,
   RefreshCcw,
+  ShieldCheck,
+  Zap,
+  Waves,
+  Cpu,
   Plus,
   Send,
   History,
@@ -22,7 +26,10 @@ import {
   Languages,
   User as UserIcon,
   ExternalLink,
-  Search
+  Search,
+  XCircle,
+  AlertCircle,
+  ArrowLeft
 } from 'lucide-react';
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -50,7 +57,7 @@ import Markdown from 'react-markdown';
 
 import { MUSIC_DB, EMOTION_MAP, Emotion, Song, AVAILABLE_LANGUAGES } from './constants/music';
 import { MoodEntry, JournalEntry, UserProfile } from './types';
-import { detectEmotion, getTherapyChat, getRecommendedSongsByLanguage } from './lib/gemini';
+import { detectEmotion, getTherapyChat, getRecommendedSongsByLanguage, generateAImusic } from './lib/gemini';
 import { auth, signInWithGoogle } from './lib/firebase';
 import { handleFirestoreError } from './lib/firestore-errors';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
@@ -63,6 +70,7 @@ const SidebarNav = ({ activeTab, onTabChange }: { activeTab: string, onTabChange
   const navItems = [
     { id: 'detect', emoji: '🎭', label: 'Detect Mood' },
     { id: 'playlist', emoji: '🎶', label: 'My Playlist' },
+    { id: 'lab', emoji: '🧪', label: 'Music Lab' },
     { id: 'breathing', emoji: '🧘', label: 'Breathing' },
     { id: 'chat', emoji: '💬', label: 'AI Therapist' },
     { id: 'journey', emoji: '📊', label: 'My Journey' },
@@ -111,7 +119,6 @@ export default function App() {
   const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
   const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'model'; parts: { text: string }[] }[]>([]);
   const [isCapturing, setIsCapturing] = useState(false);
-  const [apiLimited, setApiLimited] = useState(false);
   const [lastCheckTime, setLastCheckTime] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -215,14 +222,7 @@ export default function App() {
     }
   };
 
-  const handleMoodDetected = async (emotion: Emotion, conf: number, isQuota?: boolean) => {
-    if (isQuota) {
-      setApiLimited(true);
-      toast.error("Gemini API limit reached. Entering Static Therapy Mode.", { duration: 5000 });
-    } else {
-      setApiLimited(false);
-    }
-    
+  const handleMoodDetected = async (emotion: Emotion, conf: number) => {
     setCurrentEmotion(emotion);
     setConfidence(Math.round(conf));
     setLastCheckTime(new Date().toLocaleTimeString());
@@ -245,11 +245,10 @@ export default function App() {
     if (emotion === 'happy') toast.success("Glad you're feeling happy!");
     if (emotion === 'sad') toast.info("It's okay to feel sad. Music can help.");
     
-    if (chatHistory.length <= 1) {
-      getTherapyChat(emotion, [{ role: 'user', parts: [{ text: `I am feeling ${emotion}. Help me.` }] }]).then(msg => {
-        setChatHistory([{ role: 'model', parts: [{ text: msg || '' }] }]);
-      });
-    }
+    // Always fetch therapy talk (now static)
+    getTherapyChat(emotion).then(msg => {
+      setChatHistory([{ role: 'model', parts: [{ text: msg || '' }] }]);
+    });
   };
 
   const getThemeColor = () => {
@@ -337,11 +336,10 @@ export default function App() {
               >
                 {activeTab === 'detect' && (
                   <DetectPage 
-                    onMoodDetected={(e, c, q) => handleMoodDetected(e, c, q)} 
+                    onMoodDetected={(e, c) => handleMoodDetected(e, c)} 
                     currentEmotion={currentEmotion} 
                     confidence={confidence} 
                     lastCheckTime={lastCheckTime}
-                    apiLimited={apiLimited}
                   />
                 )}
                 {activeTab === 'playlist' && (
@@ -350,7 +348,12 @@ export default function App() {
                     profile={profile} 
                     user={user} 
                     onToggleLang={toggleLanguage} 
-                    apiLimited={apiLimited}
+                  />
+                )}
+                {activeTab === 'lab' && (
+                  <MusicLabPage 
+                    currentEmotion={currentEmotion} 
+                    profile={profile} 
                   />
                 )}
                 {activeTab === 'breathing' && (
@@ -383,7 +386,7 @@ export default function App() {
 
 // --- Sub-Pages ---
 
-const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime, apiLimited }: any) => {
+const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime }: any) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
@@ -409,7 +412,7 @@ const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime,
   }, []);
 
   const capture = async () => {
-    if (!videoRef.current || !canvasRef.current || !stream) return;
+    if (!videoRef.current || !canvasRef.current || !stream || isLoading) return;
     setIsLoading(true);
     
     const context = canvasRef.current.getContext('2d');
@@ -425,7 +428,7 @@ const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime,
       
       try {
         const result = await detectEmotion(dataUrl);
-        onMoodDetected(result.emotion, result.confidence, result.isQuotaError);
+        onMoodDetected(result.emotion, result.confidence);
       } catch (err) {
         toast.error("Analysis failed. Please try again.");
       }
@@ -500,18 +503,12 @@ const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime,
           
           <div className="absolute top-4 left-4 flex gap-2 z-30">
             <div className="bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-full flex items-center gap-2 border border-white/10">
-              <div className="w-1.5 h-1.5 bg-red-500 rounded-full animate-pulse"></div>
-              <span className="text-[10px] uppercase font-bold text-white/80 tracking-widest">Live Bio-Feed</span>
+              <div className="w-1.5 h-1.5 bg-[#4FC3F7] rounded-full animate-pulse"></div>
+              <span className="text-[10px] uppercase font-bold text-white/80 tracking-widest">Privacy Vision</span>
             </div>
             <div className="hidden sm:flex bg-[#4FC3F7]/10 backdrop-blur-md px-3 py-1.5 rounded-full items-center gap-2 text-[8px] uppercase font-bold text-[#4FC3F7] border border-[#4FC3F7]/20">
-              <Sparkles size={10} /> Tip: Ensure good lighting for 99% accuracy
+              <ShieldCheck size={10} /> Ready for Manual Scan
             </div>
-            {apiLimited && (
-              <div className="bg-amber-500/20 backdrop-blur-md px-3 py-1.5 rounded-full flex items-center gap-2 border border-amber-500/40">
-                <AlertTriangle size={10} className="text-amber-500" />
-                <span className="text-[8px] uppercase font-bold text-amber-500">API Limit Reached</span>
-              </div>
-            )}
           </div>
 
           <div className="absolute inset-0 pointer-events-none border-[1px] border-white/5 bg-gradient-to-b from-transparent via-transparent to-black/40"></div>
@@ -571,17 +568,23 @@ const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime,
           </div>
           
           <div className="bg-white/5 p-4 rounded-2xl border border-white/10 my-6">
-            <p className="text-sm italic leading-relaxed text-white/80">
-              {currentEmotion ? (
-                <>
-                  "We've detected a specialized emotional state. Activating{" "}
-                  <span className="text-[#4FC3F7] font-bold">{EMOTION_MAP[currentEmotion].label}</span> therapy mode. 
-                  Relax your shoulders and let the curated melodies support your healing journey."
-                </>
-              ) : (
-                "Capture your mood using the camera to begin your AI-powered music therapy session."
-              )}
-            </p>
+            <h4 className="text-[10px] uppercase font-black tracking-[0.2em] text-[#4FC3F7] mb-3 opacity-60">Manual Refinement</h4>
+            <div className="grid grid-cols-4 gap-2">
+              {Object.entries(EMOTION_MAP).map(([key, config]) => (
+                <button
+                  key={key}
+                  onClick={() => onMoodDetected(key as Emotion, 100)}
+                  className={`flex flex-col items-center justify-center p-2 rounded-xl transition-all border ${
+                    currentEmotion === key 
+                      ? 'bg-[#4FC3F7]/20 border-[#4FC3F7] shadow-[0_0_10px_#4FC3F733]' 
+                      : 'bg-white/5 border-white/5 hover:border-white/20'
+                  }`}
+                >
+                  <span className="text-xl mb-1">{config.emoji}</span>
+                  <span className="text-[8px] uppercase font-bold opacity-60">{key}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="flex flex-col gap-2">
@@ -605,12 +608,11 @@ const DetectPage = ({ onMoodDetected, currentEmotion, confidence, lastCheckTime,
   );
 };
 
-const PlaylistPage = ({ currentEmotion, profile, user, onToggleLang, apiLimited }: { 
+const PlaylistPage = ({ currentEmotion, profile, user, onToggleLang }: { 
   currentEmotion: Emotion | null, 
   profile: UserProfile | null, 
   user: User | null,
-  onToggleLang: (lang: string) => void,
-  apiLimited: boolean
+  onToggleLang: (lang: string) => void
 }) => {
   const [songs, setSongs] = useState<Song[]>([]);
   const [activeSong, setActiveSong] = useState<Song | null>(null);
@@ -637,18 +639,12 @@ const PlaylistPage = ({ currentEmotion, profile, user, onToggleLang, apiLimited 
         <div>
           <div className="flex items-center gap-3">
             <h3 className="text-xl font-bold">Recommended for your mood</h3>
-            {apiLimited && (
-              <div className="flex items-center gap-1.5 px-2.5 py-0.5 bg-amber-500/10 border border-amber-500/30 rounded-full">
-                <ShieldAlert size={10} className="text-amber-500" />
-                <span className="text-[9px] font-black text-amber-500 uppercase tracking-tighter">Static Mode</span>
-              </div>
-            )}
+            <div className="flex items-center gap-1.5 px-2.5 py-0.5 bg-[#4FC3F7]/10 border border-[#4FC3F7]/30 rounded-full">
+              <ShieldCheck size={10} className="text-[#4FC3F7]" />
+              <span className="text-[9px] font-black text-[#4FC3F7] uppercase tracking-tighter">Verified Library</span>
+            </div>
           </div>
-          <p className="text-sm text-white/40">
-            {apiLimited 
-              ? "High AI traffic detected. Using clinical fallback database." 
-              : "Music curated to enhance your emotional clarity"}
-          </p>
+          <p className="text-sm text-white/40">Music curated to enhance your emotional clarity</p>
         </div>
         
         <div className="flex flex-wrap gap-2 items-center">
@@ -793,6 +789,203 @@ const PlaylistPage = ({ currentEmotion, profile, user, onToggleLang, apiLimited 
               </div>
             </motion.div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MusicLabPage = ({ currentEmotion, profile }: { currentEmotion: Emotion | null, profile: UserProfile | null }) => {
+  const [aiTracks, setAiTracks] = useState<{ id: string; url: string; prompt: string; lyrics?: string }[]>([]);
+  const [activeAiTrack, setActiveAiTrack] = useState<{ id: string; url: string; prompt: string; lyrics?: string } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [genParams, setGenParams] = useState({
+    intensity: 'balanced',
+    texture: 'acoustic'
+  });
+
+  const synthesizeMusic = async () => {
+    if (!currentEmotion) return;
+    setLoading(true);
+    try {
+      const prompt = `Generate a 30-second therapeutic track for someone feeling ${currentEmotion}. The intensity should be ${genParams.intensity} and the texture should be ${genParams.texture}. No vocals, purely instrumental designed for neural entrainment.`;
+      const { audioUrl, lyrics } = await generateAImusic(prompt);
+      
+      const newTrack = {
+        id: Math.random().toString(36).substr(2, 9),
+        url: audioUrl,
+        prompt: prompt,
+        lyrics
+      };
+      
+      setAiTracks(prev => [newTrack, ...prev]);
+      toast.success("AI Audio Sequence Synthesized!");
+    } catch (error) {
+      toast.error("Synthesis failed. This might be due to AI safety filters or quota.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="space-y-8 pb-12">
+      <div className="glass-card p-10 border-[#4FC3F7]/30 bg-gradient-to-br from-[#4FC3F7]/10 via-black to-transparent relative overflow-hidden">
+        <div className="absolute top-0 right-0 p-8 opacity-5">
+          <Cpu size={250} className="text-[#4FC3F7]" />
+        </div>
+        <div className="relative z-10 space-y-8">
+          <div className="flex items-center gap-5">
+            <div className="w-14 h-14 bg-[#4FC3F7]/20 rounded-2xl flex items-center justify-center text-[#4FC3F7] shadow-[0_0_30px_rgba(79,195,247,0.2)]">
+              <Sparkles size={28} />
+            </div>
+            <div>
+              <h2 className="text-4xl font-black uppercase tracking-[0.25em] text-[#4FC3F7]">Gemini Music Lab</h2>
+              <p className="text-xs text-white/40 mt-1 uppercase tracking-[0.3em] font-black">AI Neural Generation v3.0</p>
+            </div>
+          </div>
+          <p className="text-xl text-white/70 max-w-2xl leading-relaxed font-medium">
+            Generate unique audio sequences specifically tailored to your current mood using Google's Lyria AI. These are synthesized on-the-fly, not pre-recorded tracks.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 pt-4">
+            <div className="space-y-4">
+              <label className="text-[10px] uppercase font-black text-[#4FC3F7] tracking-[0.4em]">Amplitude (Intensity)</label>
+              <div className="flex gap-2 p-1.5 bg-black/80 rounded-2xl border border-white/5 shadow-inner">
+                {['mellow', 'balanced', 'high'].map(v => (
+                  <button key={v} onClick={() => setGenParams(p => ({...p, intensity: v}))} className={`flex-1 py-3.5 rounded-xl text-[10px] uppercase font-black transition-all ${genParams.intensity === v ? 'bg-[#4FC3F7] text-black shadow-[0_0_20px_#4FC3F788]' : 'text-white/30 hover:text-white hover:bg-white/5'}`}>{v}</button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-4">
+              <label className="text-[10px] uppercase font-black text-[#4FC3F7] tracking-[0.4em]">Harmonics (Texture)</label>
+              <div className="flex gap-2 p-1.5 bg-black/80 rounded-2xl border border-white/5 shadow-inner">
+                {['acoustic', 'synthetic'].map(v => (
+                  <button key={v} onClick={() => setGenParams(p => ({...p, texture: v}))} className={`flex-1 py-3.5 rounded-xl text-[10px] uppercase font-black transition-all ${genParams.texture === v ? 'bg-[#4FC3F7] text-black shadow-[0_0_20px_#4FC3F788]' : 'text-white/30 hover:text-white hover:bg-white/5'}`}>{v}</button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-end">
+              <button 
+                onClick={synthesizeMusic} 
+                disabled={loading || !currentEmotion} 
+                className="w-full h-[62px] bg-[#4FC3F7] text-black rounded-2xl font-black uppercase tracking-[0.3em] text-xs flex items-center justify-center gap-3 hover:bg-white hover:scale-[1.02] active:scale-95 transition-all shadow-[0_0_40px_rgba(79,195,247,0.5)] disabled:opacity-50 disabled:grayscale mb-1.5"
+              >
+                {loading ? <RefreshCcw size={20} className="animate-spin" /> : <Waves size={20} />} 
+                {loading ? "Generating Audio..." : "Generate AI Music"}
+              </button>
+            </div>
+          </div>
+          {!currentEmotion && <div className="bg-amber-500/10 border border-amber-500/20 p-5 rounded-3xl flex items-center gap-5 backdrop-blur-md"><div className="w-10 h-10 bg-amber-500/20 rounded-full flex items-center justify-center text-amber-500">!</div><p className="text-[10px] text-amber-500/90 uppercase font-black tracking-[0.25em]">Neural Input Required: Please scan your mood in the Detect tab before synthesis.</p></div>}
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="h-80 glass-card flex flex-col items-center justify-center gap-8 border-dashed border-[#4FC3F7]/20">
+          <div className="relative"><RefreshCcw size={80} className="animate-spin text-[#4FC3F7]/20" /><Sparkles size={30} className="absolute inset-0 m-auto text-[#4FC3F7] animate-pulse" /></div>
+          <div className="text-center space-y-3">
+            <p className="uppercase text-lg font-black tracking-[0.5em] text-[#4FC3F7] animate-pulse">Synthesizing Unique Waves</p>
+            <div className="flex gap-1 justify-center">{[1, 2, 3, 4, 5].map(i => <div key={i} className="w-1 h-4 bg-[#4FC3F7] rounded-full animate-bounce" style={{ animationDelay: `${i * 0.1}s` }}></div>)}</div>
+          </div>
+        </div>
+      ) : aiTracks.length > 0 ? (
+        <div className="space-y-8 animate-in fade-in slide-in-from-bottom-8 duration-1000">
+          <div className="flex items-center justify-between px-4">
+            <div className="flex items-center gap-6">
+               <div className="w-1.5 h-1.5 rounded-full bg-[#4FC3F7] animate-ping"></div>
+              <h3 className="text-2xl font-black uppercase tracking-[0.3em]">AI Generated Tracks</h3>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {aiTracks.map((track, i) => (
+              <motion.div key={track.id} initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.08, type: "spring", stiffness: 100 }}>
+                <div onClick={() => setActiveAiTrack(track)} className="bg-white/5 border border-[#4FC3F7]/20 hover:border-[#4FC3F7] p-8 rounded-[2rem] cursor-pointer group transition-all relative overflow-hidden backdrop-blur-sm">
+                  <div className="absolute top-0 right-0 p-6 opacity-10 group-hover:opacity-30 transition-opacity"><Cpu size={50} className="text-[#4FC3F7]" /></div>
+                  <div className="relative z-10">
+                    <div className="flex justify-between items-start mb-6">
+                      <span className="text-[10px] font-black text-[#4FC3F7] uppercase tracking-widest bg-[#4FC3F7]/10 border border-[#4FC3F7]/20 px-3 py-1 rounded-full">AI GENERATED</span>
+                      <div className="flex gap-1">{[1, 2, 3, 4].map(j => <div key={j} className="w-1 h-3 bg-[#4FC3F7] rounded-full animate-pulse" style={{ animationDelay: `${j * 0.2}s` }}></div>)}</div>
+                    </div>
+                    <h4 className="font-bold text-xl leading-tight group-hover:text-[#4FC3F7] transition-colors mb-2">Soundscape #{track.id.slice(0, 4)}</h4>
+                    <p className="text-[10px] text-white/30 mb-6 font-medium uppercase tracking-widest line-clamp-2">Prompt: {track.prompt}</p>
+                    <div className="flex items-center gap-3">
+                      <button className="flex items-center gap-2 bg-[#4FC3F7] text-black px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-transform">
+                        <Waves size={14} /> Play Sequence
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="h-80 glass-card flex flex-col items-center justify-center gap-6 border-dashed border-white/5 opacity-50 text-center">
+          <Sparkles size={50} className="text-white/10" />
+          <div>
+             <p className="uppercase text-xs font-black tracking-[0.4em] text-white/30 mb-2">Neural Engine Ready</p>
+             <p className="text-[10px] text-white/20 uppercase tracking-[0.2em]">Generate custom AI music tracks using Google Lyria</p>
+          </div>
+        </div>
+      )}
+
+      {activeAiTrack && (
+        <div className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-3xl flex items-center justify-center p-8">
+          <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="w-full max-w-4xl space-y-12">
+            <div className="flex justify-between items-center px-6">
+              <div className="flex items-center gap-6">
+                <div className="w-16 h-16 bg-[#4FC3F7]/20 rounded-3xl flex items-center justify-center text-[#4FC3F7] border border-[#4FC3F7]/30 shadow-[0_0_30px_rgba(79,195,247,0.3)]">
+                  <Waves size={32} className="animate-pulse" />
+                </div>
+                <div>
+                  <h3 className="text-3xl font-black uppercase tracking-[0.2em] text-[#4FC3F7]">Sequence #{activeAiTrack.id}</h3>
+                  <p className="text-[10px] text-white/30 uppercase tracking-[0.4em] font-bold mt-2">Personalized Audio Synthesis • 30s Loop</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setActiveAiTrack(null)}
+                className="w-14 h-14 bg-white/5 hover:bg-black hover:text-[#4FC3F7] rounded-full transition-all flex items-center justify-center border border-white/10 group"
+              >
+                <XCircle size={32} className="group-hover:scale-110 transition-transform" />
+              </button>
+            </div>
+
+            <div className="glass-card py-24 flex flex-col items-center justify-center gap-12 border-[#4FC3F7]/40 bg-black shadow-[0_0_100px_rgba(79,195,247,0.1)] relative overflow-hidden">
+               {/* Visualizer simulation */}
+               <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
+                 <div className="flex gap-2 items-end h-64">
+                   {[...Array(20)].map((_, i) => (
+                     <motion.div 
+                        key={i} 
+                        initial={{ height: 20 }}
+                        animate={{ height: [20, Math.random() * 200 + 50, 20] }} 
+                        transition={{ repeat: Infinity, duration: 1.2 + Math.random() }} 
+                        className="w-1.5 bg-[#4FC3F7] rounded-full"
+                    />
+                   ))}
+                 </div>
+               </div>
+
+               <div className="relative z-10 space-y-8 flex flex-col items-center">
+                 <audio controls autoPlay src={activeAiTrack.url} className="w-full max-w-lg h-14 invent-filter opacity-80 hover:opacity-100 transition-opacity" />
+                 <p className="text-xs text-[#4FC3F7]/60 font-medium text-center uppercase tracking-widest max-w-md italic">
+                   "Auditory reflection generated for your emotional state."
+                 </p>
+               </div>
+            </div>
+
+            <div className="flex justify-center gap-6">
+               <button 
+                 onClick={() => {
+                   const a = document.createElement('a');
+                   a.href = activeAiTrack.url;
+                   a.download = `therapy-sequence-${activeAiTrack.id}.wav`;
+                   a.click();
+                 }}
+                 className="px-12 py-5 bg-white/10 text-white rounded-2xl font-black uppercase tracking-[0.3em] text-[10px] hover:bg-[#4FC3F7] hover:text-black transition-all flex items-center gap-3"
+               >
+                 <ExternalLink size={16} /> Export Master PCM
+               </button>
+            </div>
+          </motion.div>
         </div>
       )}
     </div>
