@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User preferences and metadata",
+      "type": "object",
+      "properties": {
+        "languages": {
+          "type": "array",
+          "description": "Preferred languages for music recommendations"
+        },
+        "lastEmotion": {
+          "type": "string",
+          "description": "The last detected emotion"
+        }
+      },
+      "required": ["languages"]
+    },
+    "MoodEntry": {
+      "title": "Mood Entry",
+      "description": "A single mood detection record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "emotion": { "type": "string" },
+        "confidence": { "type": "number" },
+        "note": { "type": "string" }
+      },
+      "required": ["id", "timestamp", "emotion", "confidence"]
+    },
+    "JournalEntry": {
+      "title": "Journal Entry",
+      "description": "A personal reflection associated with a mood",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "text": { "type": "string" },
+        "moodAtTime": { "type": "string" }
+      },
+      "required": ["id", "timestamp", "text", "moodAtTime"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile document"
+    },
+    "mood_history/{userId}": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "entries": { "type": "array", "items": { "$ref": "MoodEntry" } }
+        }
+      },
+      "description": "Mood history collection"
+    },
+    "journals/{userId}": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "entries": { "type": "array", "items": { "$ref": "JournalEntry" } }
+        }
+      },
+      "description": "Journal entries collection"
+    }
+  }
+}

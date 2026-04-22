@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 3. Global Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // 4. User Profiles
+    match /users/{userId} {
+      function isValidUserProfile(data) {
+        return data.languages is list 
+          && data.languages.size() >= 1 
+          && data.languages.size() <= 10
+          && (data.get('lastEmotion', null) == null || data.lastEmotion is string);
+      }
+
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) 
+        && isValidUserProfile(incoming())
+        && incoming().keys().hasAll(['languages'])
+        && incoming().keys().size() >= 1;
+      allow update: if isOwner(userId) 
+        && isValidUserProfile(incoming())
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['languages', 'lastEmotion'])
+        );
+    }
+
+    // 5. Mood History
+    match /mood_history/{userId} {
+      allow get, create, update: if isOwner(userId);
+    }
+
+    // 6. Journal Entries
+    match /journals/{userId} {
+      allow get, create, update: if isOwner(userId);
+    }
+  }
+}

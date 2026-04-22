@@ -1,0 +1,6 @@
+{
+  "name": "MoodMelody - AI Music Therapist",
+  "description": "An AI-powered music therapist that detects your mood via webcam and provides therapeutic playlists, breathing exercises, and empathetic AI chat support.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["photo", "ai", "dashboard"]
+}
