@@ -598,6 +598,7 @@ export default function App() {
                     confidence={confidence}
                     lastCheckTime={lastCheckTime}
                     scanCount={scanCount}
+                    onTabChange={setActiveTab}
                   />
                 )}
                 {activeTab === 'playlist' && (
@@ -644,7 +645,55 @@ export default function App() {
 
 // --- Sub-Pages ---
 
-const DetectPage = ({ onScanStart, onMoodDetected, currentEmotion, confidence, lastCheckTime, scanCount }: any) => {
+const EMOTION_SUGGESTIONS: Record<string, {
+  title: string;
+  affirmation: string;
+  activities: string[];
+  quotes: string;
+}> = {
+  happy: {
+    title: "Radiate & Celebrate",
+    affirmation: "I embrace my joy and share my positive energy with the world.",
+    activities: [
+      "Spread the joy: reach out to a friend and share a positive thought or compliment.",
+      "Journal this moment: document what made you happy today so you can revisit it later.",
+      "Engage in high-energy creation: draw, sing, write, or work on a passion project."
+    ],
+    quotes: "“Joy is not in things; it is in us.” — Richard Wagner"
+  },
+  sad: {
+    title: "Gently Healing & Comforting",
+    affirmation: "It is okay to not be okay. I allow myself to feel, heal, and rest.",
+    activities: [
+      "Listen to the Comforting/Sad playlist: let the music help you release pent-up emotions.",
+      "Somatic check-in: close your eyes, take 5 slow breaths, and release tension in your shoulders.",
+      "Comforting self-care: wrap yourself in a warm blanket, sip herbal tea, or step outside for fresh air."
+    ],
+    quotes: "“Tears are words that need to be written.” — Paulo Coelho"
+  },
+  angry: {
+    title: "Grounding & Releasing Tension",
+    affirmation: "I breathe in peace and breathe out anger. My reactions are within my control.",
+    activities: [
+      "Physical release: try our Zen Bubble Pop game to release physical frustration safely.",
+      "Somatic regulation: splash cold water on your face or practice our 4-4-4 breathing loop.",
+      "Expressive writing: dump your thoughts onto a journal page, then close or delete it to let it go."
+    ],
+    quotes: "“For every minute you are angry you lose sixty seconds of happiness.” — Ralph Waldo Emerson"
+  },
+  neutral: {
+    title: "Centering & Raising Vibrations",
+    affirmation: "I am calm, centered, and present in this moment. I welcome peace.",
+    activities: [
+      "Practice mindfulness: try the Kaleidoscope Flow game to create relaxing symmetric shapes.",
+      "Set an intention: choose one small task or self-care activity to focus on next.",
+      "Ambient Sound Bath: toggle the ocean or rain sound cards to deepen your calm focus."
+    ],
+    quotes: "“Within you, there is a stillness and a sanctuary to which you can retreat at any time.” — Hermann Hesse"
+  }
+};
+
+const DetectPage = ({ onScanStart, onMoodDetected, currentEmotion, confidence, lastCheckTime, scanCount, onTabChange }: any) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1139,6 +1188,100 @@ const DetectPage = ({ onScanStart, onMoodDetected, currentEmotion, confidence, l
           </div>
         </div>
       </div>
+
+      {/* Dynamic Suggestions & Actionable Coping Strategies Panel */}
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={currentEmotion || 'none'}
+          initial={{ opacity: 0, y: 15 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -15 }}
+          transition={{ duration: 0.4 }}
+          className="w-full mt-6"
+        >
+          <Card 
+            style={{
+              borderColor: currentEmotion ? `${EMOTION_MAP[currentEmotion].color}40` : 'rgba(255, 255, 255, 0.1)',
+              boxShadow: currentEmotion ? `0 10px 30px -10px ${EMOTION_MAP[currentEmotion].color}15` : 'none'
+            }}
+            className="glass-card p-8 bg-gradient-to-br from-white/[0.02] via-black/40 to-transparent border overflow-hidden relative"
+          >
+            {currentEmotion && (
+              <div 
+                style={{ backgroundColor: EMOTION_MAP[currentEmotion].color }}
+                className="absolute top-[-10%] right-[-10%] w-[20%] h-[40%] rounded-full blur-[100px] pointer-events-none opacity-20"
+              />
+            )}
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 relative z-10">
+              <div className="lg:col-span-4 flex flex-col justify-between space-y-4">
+                <div>
+                  <span className="text-[10px] font-bold text-[#4FC3F7] uppercase tracking-widest bg-[#4FC3F7]/10 px-3 py-1 rounded-full">
+                    Therapeutic Insights
+                  </span>
+                  <h3 className="text-2xl font-black uppercase tracking-wider text-white mt-3 leading-tight">
+                    {currentEmotion ? EMOTION_SUGGESTIONS[currentEmotion].title : "Awaiting Insight"}
+                  </h3>
+                </div>
+                <div className="bg-white/[0.03] border border-white/5 p-5 rounded-2xl">
+                  <p className="text-[10px] text-white/40 uppercase font-black tracking-widest mb-1.5">Daily Affirmation</p>
+                  <p className="text-sm font-medium text-white/90 italic leading-relaxed">
+                    "{currentEmotion ? EMOTION_SUGGESTIONS[currentEmotion].affirmation : "Analyze your emotion to receive a custom daily affirmation."}"
+                  </p>
+                </div>
+              </div>
+
+              <div className="lg:col-span-5 space-y-4">
+                <h4 className="text-[10px] uppercase font-black tracking-[0.2em] text-white/40">Actionable Suggestions</h4>
+                <div className="flex flex-col gap-3">
+                  {(currentEmotion ? EMOTION_SUGGESTIONS[currentEmotion].activities : [
+                    "Position your face inside the glowing HUD guide target above.",
+                    "Click the Camera 📷 scan button to begin your real-time emotion analysis.",
+                    "Or upload a selfie from your photo library to detect your mood."
+                  ]).map((activity, i) => (
+                    <div key={i} className="flex gap-3 items-start bg-white/[0.01] hover:bg-white/[0.03] p-3 rounded-xl border border-white/[0.02] transition-colors">
+                      <div className="w-5 h-5 rounded-full bg-[#4FC3F7]/10 border border-[#4FC3F7]/30 flex items-center justify-center text-[10px] font-mono text-[#4FC3F7] shrink-0 mt-0.5">
+                        {i + 1}
+                      </div>
+                      <p className="text-xs text-white/70 leading-relaxed font-semibold">{activity}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="lg:col-span-3 flex flex-col justify-between space-y-6">
+                <div className="space-y-2">
+                  <h4 className="text-[10px] uppercase font-black tracking-[0.2em] text-white/40">Inspirational Echo</h4>
+                  <p className="text-xs text-white/60 leading-relaxed font-medium italic">
+                    {currentEmotion ? EMOTION_SUGGESTIONS[currentEmotion].quotes : "“Self-care is how you take your power back.” — Lalah Delia"}
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => {
+                    if (!currentEmotion) {
+                      onScanStart?.();
+                    } else {
+                      const routes: Record<string, string> = {
+                        happy: 'lab',
+                        sad: 'playlist',
+                        angry: 'breathing',
+                        neutral: 'journal'
+                      };
+                      onTabChange(routes[currentEmotion]);
+                    }
+                  }}
+                  className="w-full py-4 rounded-xl bg-white text-black font-black uppercase tracking-widest text-[10px] hover:bg-[#4FC3F7] hover:scale-[1.02] active:scale-95 transition-all flex items-center justify-center gap-2 shadow-xl cursor-pointer"
+                >
+                  <Sparkles size={14} />
+                  {currentEmotion ? `Open ${currentEmotion === 'happy' ? 'Music Lab' : currentEmotion === 'sad' ? 'My Playlist' : currentEmotion === 'angry' ? 'Relaxation Guide' : 'Mood Journal'}` : "Initiate Biometric Scan"}
+                </button>
+              </div>
+            </div>
+          </Card>
+        </motion.div>
+      </AnimatePresence>
+
       <canvas ref={canvasRef} width="640" height="480" className="hidden" />
     </div>
   );
