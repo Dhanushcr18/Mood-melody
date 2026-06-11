@@ -534,7 +534,7 @@ export default function App() {
 
       <SidebarNav activeTab={activeTab} onTabChange={setActiveTab} />
 
-      <main className="flex-1 flex flex-col p-8 gap-6 overflow-hidden relative z-10">
+      <main className="flex-1 flex flex-col p-6 gap-6 overflow-hidden relative z-10">
         {/* Header Section */}
         <header className="flex justify-between items-start shrink-0">
           <div>
@@ -566,7 +566,7 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
-          <div className="max-w-6xl mx-auto space-y-8 pb-8">
+          <div className="w-full space-y-8 pb-4">
             <AnimatePresence mode="wait">
               <motion.div
                 key={activeTab}
