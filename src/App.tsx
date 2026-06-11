@@ -58,11 +58,9 @@ import Markdown from 'react-markdown';
 import { MUSIC_DB, EMOTION_MAP, Emotion, Song, AVAILABLE_LANGUAGES } from './constants/music';
 import { MoodEntry, JournalEntry, UserProfile } from './types';
 import { detectEmotion, getTherapyChat, getRecommendedSongsByLanguage, generateAImusic, loadFaceApiModels } from './lib/gemini';
-import { auth, signInWithGoogle, signInAsDemo, getDemoUser, isDemoModeEnabled } from './lib/firebase';
-import { handleFirestoreError } from './lib/firestore-errors';
-import { onAuthStateChanged, signOut, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, updateDoc, arrayUnion, onSnapshot } from 'firebase/firestore';
-import { db } from './lib/firebase';
+import { auth, signInWithGoogle } from './lib/firebase';
+import { signOut, User } from 'firebase/auth';
+import { apiClient } from './lib/api-client';
 
 // --- Components ---
 
@@ -95,19 +93,19 @@ type SongPreview = {
 const getSongPreview = async (song: Song): Promise<SongPreview | null> => {
   try {
     const term = encodeURIComponent(`${song.name} ${song.artist}`);
-    const response = await fetch(
+    let response = await fetch(
       `https://itunes.apple.com/search?term=${term}&media=music&entity=song&limit=5&country=IN`
     );
 
     if (!response.ok) return null;
 
-    const data = await response.json();
-    const results = Array.isArray(data.results) ? data.results : [];
+    let data = await response.json();
+    let results = Array.isArray(data.results) ? data.results : [];
 
     const normalizedSong = song.name.toLowerCase();
     const normalizedArtist = song.artist.toLowerCase();
 
-    const exactishMatch =
+    let exactishMatch =
       results.find((item: any) => {
         const trackName = String(item.trackName || '').toLowerCase();
         const artistName = String(item.artistName || '').toLowerCase();
@@ -118,6 +116,45 @@ const getSongPreview = async (song: Song): Promise<SongPreview | null> => {
         );
       }) ||
       results.find((item: any) => item.previewUrl);
+
+    // Fallback: If no match was found with name + artist, search by song name alone
+    if (!exactishMatch) {
+      const nameTerm = encodeURIComponent(song.name);
+      response = await fetch(
+        `https://itunes.apple.com/search?term=${nameTerm}&media=music&entity=song&limit=15&country=IN`
+      );
+      if (response.ok) {
+        data = await response.json();
+        results = Array.isArray(data.results) ? data.results : [];
+        
+        // Find matching track by name with partial artist overlap
+        const artistWords = normalizedArtist.split(/\s+/).filter(w => w.length > 2);
+        exactishMatch = results.find((item: any) => {
+          if (!item.previewUrl) return false;
+          const trackName = String(item.trackName || '').toLowerCase();
+          const artistName = String(item.artistName || '').toLowerCase();
+          
+          const nameMatch = trackName.includes(normalizedSong) || normalizedSong.includes(trackName);
+          const artistMatch = artistWords.some(word => artistName.includes(word)) || artistName.includes(normalizedArtist) || normalizedArtist.includes(artistName);
+          
+          return nameMatch && artistMatch;
+        });
+
+        // If still no overlap, check if any track name matches closely
+        if (!exactishMatch) {
+          exactishMatch = results.find((item: any) => {
+            if (!item.previewUrl) return false;
+            const trackName = String(item.trackName || '').toLowerCase();
+            return trackName.includes(normalizedSong) || normalizedSong.includes(trackName);
+          });
+        }
+
+        // Final fallback: just take the first result with a preview URL
+        if (!exactishMatch && results.length > 0) {
+          exactishMatch = results.find((item: any) => item.previewUrl);
+        }
+      }
+    }
 
     if (!exactishMatch?.previewUrl || !exactishMatch?.trackViewUrl) {
       return null;
@@ -193,101 +230,111 @@ export default function App() {
   const [scanCount, setScanCount] = useState(0);
   const [authLoading, setAuthLoading] = useState(true);
 
-  const getStoredDemoProfile = (): UserProfile => {
+  const fetchAllData = async () => {
     try {
-      const saved = localStorage.getItem('demo_profile_languages');
-      const languages = saved ? JSON.parse(saved) : ['English'];
-      return {
-        languages: Array.isArray(languages) && languages.length > 0 ? languages : ['English'],
-      };
-    } catch {
-      return { languages: ['English'] };
+      const profileRes = await apiClient.getUserProfile();
+      if (profileRes.data) {
+        setProfile({
+          languages: (profileRes.data as any).languages || ['English'],
+          lastEmotion: (profileRes.data as any).last_emotion || undefined
+        });
+      }
+
+      const moodsRes = await apiClient.getMoodEntries();
+      if (moodsRes.data) {
+        const mappedMoods: MoodEntry[] = (moodsRes.data as any[]).map(entry => ({
+          id: entry.id.toString(),
+          timestamp: entry.timestamp,
+          emotion: entry.emotion as Emotion,
+          confidence: Math.round(entry.confidence * 100)
+        }));
+        setMoodHistory(mappedMoods);
+      }
+
+      const journalRes = await apiClient.getJournalEntries();
+      if (journalRes.data) {
+        const mappedJournals: JournalEntry[] = (journalRes.data as any[]).map(entry => ({
+          id: entry.id.toString(),
+          timestamp: entry.timestamp,
+          text: entry.text,
+          moodAtTime: entry.mood_at_time as Emotion
+        }));
+        setJournalEntries(mappedJournals);
+      }
+    } catch (err) {
+      console.error("Error fetching data from Django:", err);
     }
   };
 
-  // Auth & Data Listeners
+  // Auth & Data Listeners on Mount
   useEffect(() => {
-    let profileUnsub: (() => void) | null = null;
-    let entriesUnsub: (() => void) | null = null;
-    let journalUnsub: (() => void) | null = null;
-
-    const authUnsub = onAuthStateChanged(auth, async (u) => {
-      if (!u && isDemoModeEnabled()) {
-        setUser(getDemoUser());
-        setProfile(getStoredDemoProfile());
-        setAuthLoading(false);
-        return;
-      }
-
-      setUser(u);
-      setAuthLoading(false);
-
-      // Cleanup previous listeners if any exist
-      if (profileUnsub) profileUnsub();
-      if (entriesUnsub) entriesUnsub();
-      if (journalUnsub) journalUnsub();
-
-      if (u) {
-        // Fetch or create profile
-        const profileRef = doc(db, 'users', u.uid);
+    const checkAuth = async () => {
+      const token = localStorage.getItem('authToken');
+      if (token) {
         try {
-          const profileSnap = await getDoc(profileRef);
-          if (profileSnap.exists()) {
-            setProfile(profileSnap.data() as UserProfile);
+          const profileRes = await apiClient.getUserProfile();
+          if (profileRes.data) {
+            const username = (profileRes.data as any).user?.username || 'demo';
+            const email = (profileRes.data as any).user?.email || 'demo@moodmelody.local';
+            
+            setUser({
+              uid: username,
+              email: email,
+              displayName: (profileRes.data as any).user?.first_name || 'Demo User',
+            } as any);
+            
+            setProfile({
+              languages: (profileRes.data as any).languages || ['English'],
+              lastEmotion: (profileRes.data as any).last_emotion || undefined
+            });
+            
+            // Load history & journals
+            const moodsRes = await apiClient.getMoodEntries();
+            if (moodsRes.data) {
+              const mappedMoods: MoodEntry[] = (moodsRes.data as any[]).map(entry => ({
+                id: entry.id.toString(),
+                timestamp: entry.timestamp,
+                emotion: entry.emotion as Emotion,
+                confidence: Math.round(entry.confidence * 100)
+              }));
+              setMoodHistory(mappedMoods);
+            }
+            
+            const journalRes = await apiClient.getJournalEntries();
+            if (journalRes.data) {
+              const mappedJournals: JournalEntry[] = (journalRes.data as any[]).map(entry => ({
+                id: entry.id.toString(),
+                timestamp: entry.timestamp,
+                text: entry.text,
+                moodAtTime: entry.mood_at_time as Emotion
+              }));
+              setJournalEntries(mappedJournals);
+            }
           } else {
-            const newProfile: UserProfile = { languages: ['English'] };
-            await setDoc(profileRef, newProfile);
-            setProfile(newProfile);
+            apiClient.clearToken();
+            setUser(null);
+            setProfile(null);
           }
         } catch (err) {
-          console.error("Initial profile fetch failed:", err);
+          console.error("Mount auth check failed:", err);
+          apiClient.clearToken();
+          setUser(null);
+          setProfile(null);
         }
-
-        // Real-time listeners for data
-        profileUnsub = onSnapshot(profileRef, (docSnap) => {
-          const data = docSnap.exists() ? docSnap.data() : null;
-          if (data) {
-            setProfile({
-              languages: Array.isArray(data.languages) ? data.languages : ['English'],
-              lastEmotion: data.lastEmotion
-            });
-          } else {
-            const fallback: UserProfile = { languages: ['English'] };
-            setDoc(profileRef, fallback);
-            setProfile(fallback);
-          }
-        }, (err) => {
-          console.error("Profile listener error:", err);
-          toast.error("Real-time sync error. Please refresh.");
-        });
-
-        entriesUnsub = onSnapshot(doc(db, 'mood_history', u.uid), (doc) => {
-          if (doc.exists()) setMoodHistory(doc.data().entries || []);
-        });
-
-        journalUnsub = onSnapshot(doc(db, 'journals', u.uid), (doc) => {
-          if (doc.exists()) setJournalEntries(doc.data().entries || []);
-        });
       } else {
+        setUser(null);
         setProfile(null);
-        setMoodHistory([]);
-        setJournalEntries([]);
       }
-    });
-
-    return () => {
-      authUnsub();
-      if (profileUnsub) profileUnsub();
-      if (entriesUnsub) entriesUnsub();
-      if (journalUnsub) journalUnsub();
+      setAuthLoading(false);
     };
+    
+    checkAuth();
   }, []);
 
   const toggleLanguage = async (lang: string) => {
-    const demoMode = isDemoModeEnabled();
     const currentProfile = profile || { languages: ['English'] };
 
-    if (!user && !demoMode) {
+    if (!user) {
       toast.error("Session initializing...");
       return;
     }
@@ -306,23 +353,18 @@ export default function App() {
     }
 
     try {
-      if (demoMode) {
-        const nextProfile: UserProfile = {
-          ...currentProfile,
-          languages: nextLangs,
-        };
-        localStorage.setItem('demo_profile_languages', JSON.stringify(nextLangs));
-        setProfile(nextProfile);
+      const res = await apiClient.updateUserProfile(nextLangs);
+      if (res.data) {
+        setProfile({
+          languages: (res.data as any).languages || ['English'],
+          lastEmotion: (res.data as any).last_emotion || undefined
+        });
         toast.success(`${currentLangs.includes(lang) ? 'Removed' : 'Added'} ${lang}`);
-        return;
+      } else {
+        toast.error(res.error || "Failed to update profile languages");
       }
-
-      const profileRef = doc(db, 'users', user.uid);
-      // Use setDoc with merge to ensure doc creation and field update
-      await setDoc(profileRef, { languages: nextLangs }, { merge: true });
-      toast.success(`${currentLangs.includes(lang) ? 'Removed' : 'Added'} ${lang}`);
     } catch (err: any) {
-      handleFirestoreError(err, 'update', `users/${user.uid}`);
+      toast.error("Profile update failed");
     }
   };
 
@@ -336,24 +378,29 @@ export default function App() {
     setScanCount((count) => count + 1);
 
     if (user) {
-      const newEntry: MoodEntry = {
-        id: Date.now().toString(),
-        timestamp: new Date().toISOString(),
-        emotion,
-        confidence: conf,
-      };
       try {
-        const historyRef = doc(db, 'mood_history', user.uid);
-        await setDoc(historyRef, { entries: arrayUnion(newEntry) }, { merge: true });
+        const res = await apiClient.createMoodEntry(emotion, conf / 100);
+        if (res.data) {
+          const moodsRes = await apiClient.getMoodEntries();
+          if (moodsRes.data) {
+            const mappedMoods: MoodEntry[] = (moodsRes.data as any[]).map(entry => ({
+              id: entry.id.toString(),
+              timestamp: entry.timestamp,
+              emotion: entry.emotion as Emotion,
+              confidence: Math.round(entry.confidence * 100)
+            }));
+            setMoodHistory(mappedMoods);
+          }
+          setProfile(prev => prev ? { ...prev, lastEmotion: emotion } : null);
+        }
       } catch (err: any) {
-        handleFirestoreError(err, 'write', `mood_history/${user.uid}`);
+        toast.error("Failed to save mood entry to database.");
       }
     }
 
     if (emotion === 'happy') toast.success("Glad you're feeling happy!");
     if (emotion === 'sad') toast.info("It's okay to feel sad. Music can help.");
 
-    // Always fetch therapy talk (now static)
     getTherapyChat(emotion).then(msg => {
       setChatHistory([{ role: 'model', parts: [{ text: msg || '' }] }]);
     });
@@ -394,9 +441,35 @@ export default function App() {
             onClick={async () => {
               try {
                 setLoginError(null);
-                await signInWithGoogle();
+                const fbUser = await signInWithGoogle();
+                if (fbUser) {
+                  let loginRes = await apiClient.login(fbUser.uid, fbUser.uid);
+                  if (loginRes.error) {
+                    const regRes = await apiClient.register(
+                      fbUser.uid,
+                      fbUser.email || `${fbUser.uid}@google.local`,
+                      fbUser.uid
+                    );
+                    if (regRes.error) {
+                      throw new Error(regRes.error);
+                    }
+                    loginRes = await apiClient.login(fbUser.uid, fbUser.uid);
+                    if (loginRes.error) {
+                      throw new Error(loginRes.error);
+                    }
+                  }
+                  if ((loginRes.data as any)?.token) {
+                    apiClient.setToken((loginRes.data as any).token);
+                    setUser({
+                      uid: fbUser.uid,
+                      email: fbUser.email || '',
+                      displayName: fbUser.displayName || 'Google User',
+                    } as any);
+                    await fetchAllData();
+                  }
+                }
               } catch (error: any) {
-                setLoginError(error.message);
+                setLoginError(error.message || "Google sign-in to Django failed");
               }
             }}
             className="w-full h-14 bg-white text-black font-bold uppercase tracking-widest hover:scale-[0.98] transition-transform rounded-2xl flex items-center justify-center gap-3 shadow-2xl"
@@ -412,11 +485,28 @@ export default function App() {
             onClick={async () => {
               try {
                 setLoginError(null);
-                const demoUser = await signInAsDemo();
-                setUser(demoUser);
-                setProfile(getStoredDemoProfile());
+                let loginRes = await apiClient.login("demo", "demo12345");
+                if (loginRes.error) {
+                  const regRes = await apiClient.register("demo", "demo@moodmelody.local", "demo12345");
+                  if (regRes.error) {
+                    throw new Error(regRes.error);
+                  }
+                  loginRes = await apiClient.login("demo", "demo12345");
+                  if (loginRes.error) {
+                    throw new Error(loginRes.error);
+                  }
+                }
+                if ((loginRes.data as any)?.token) {
+                  apiClient.setToken((loginRes.data as any).token);
+                  setUser({
+                    uid: "demo",
+                    email: "demo@moodmelody.local",
+                    displayName: "Demo User",
+                  } as any);
+                  await fetchAllData();
+                }
               } catch (error: any) {
-                setLoginError(error.message);
+                setLoginError(error.message || "Test Mode login failed");
               }
             }}
             className="w-full h-12 bg-[#4FC3F7]/20 text-[#4FC3F7] font-bold uppercase tracking-widest hover:scale-[0.98] transition-transform rounded-xl border border-[#4FC3F7]/50"
@@ -458,7 +548,14 @@ export default function App() {
             </div>
             {user && (
               <button
-                onClick={() => signOut(auth)}
+                onClick={async () => {
+                  await signOut(auth);
+                  apiClient.clearToken();
+                  setUser(null);
+                  setProfile(null);
+                  setMoodHistory([]);
+                  setJournalEntries([]);
+                }}
                 className="w-10 h-10 rounded-full bg-white/5 border border-white/10 flex items-center justify-center hover:bg-red-500/20 hover:border-red-500/40 transition-colors"
                 title="Sign Out"
               >
@@ -1090,22 +1187,19 @@ const PlaylistPage = ({ currentEmotion, profile, user, onToggleLang }: {
   }, [songs]);
 
   useEffect(() => {
-    if (!verifiedSongs.length) {
-      if (songs.length > 0) {
-        setActiveSong((current) => {
-          if (current && songs.some((song) => song.id === current.id)) {
-            return current;
-          }
-          return songs[0];
-        });
-      } else {
-        setActiveSong(null);
-      }
+    if (songs.length === 0) {
+      setActiveSong(null);
       return;
     }
 
-    if (!activeSong || !verifiedSongs.some((song) => song.id === activeSong.id)) {
+    if (activeSong && songs.some((song) => song.id === activeSong.id)) {
+      return;
+    }
+
+    if (verifiedSongs.length > 0) {
       setActiveSong(verifiedSongs[0]);
+    } else {
+      setActiveSong(songs[0]);
     }
   }, [verifiedSongs, songs, activeSong]);
 
@@ -1572,6 +1666,1141 @@ const MusicLabPage = ({ currentEmotion, profile }: { currentEmotion: Emotion | n
   );
 };
 
+interface Bubble {
+  id: number;
+  x: number;
+  y: number;
+  size: number;
+  speed: number;
+  color: string;
+}
+
+const ZenBubblePopGame = () => {
+  const [bubbles, setBubbles] = useState<Bubble[]>([]);
+  const [score, setScore] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const playPopSound = (frequency: number) => {
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, audioCtx.currentTime);
+      gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.5);
+    } catch {
+      // Audio context blocked/unsupported
+    }
+  };
+
+  const popFrequencies = [261.63, 293.66, 329.63, 349.23, 392.00, 440.00, 493.88, 523.25];
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (bubbles.length >= 15) return;
+      const id = Date.now() + Math.random();
+      const colors = [
+        'rgba(79, 195, 247, 0.35)',
+        'rgba(240, 98, 146, 0.35)',
+        'rgba(186, 104, 200, 0.35)',
+        'rgba(77, 208, 176, 0.35)',
+        'rgba(255, 213, 79, 0.35)'
+      ];
+      const newBubble: Bubble = {
+        id,
+        x: Math.random() * 90 + 5,
+        y: 110,
+        size: Math.random() * 40 + 35,
+        speed: Math.random() * 0.7 + 0.3,
+        color: colors[Math.floor(Math.random() * colors.length)]
+      };
+      setBubbles(prev => [...prev, newBubble]);
+    }, 1300);
+
+    return () => clearInterval(interval);
+  }, [bubbles.length]);
+
+  useEffect(() => {
+    let animationFrameId: number;
+
+    const updatePosition = () => {
+      setBubbles(prev =>
+        prev
+          .map(b => ({ ...b, y: b.y - b.speed }))
+          .filter(b => b.y > -20)
+      );
+      animationFrameId = requestAnimationFrame(updatePosition);
+    };
+
+    animationFrameId = requestAnimationFrame(updatePosition);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, []);
+
+  const handlePop = (id: number) => {
+    setBubbles(prev => prev.filter(b => b.id !== id));
+    setScore(s => s + 1);
+    const randomFreq = popFrequencies[Math.floor(Math.random() * popFrequencies.length)];
+    playPopSound(randomFreq);
+  };
+
+  return (
+    <Card className="glass-card p-8 flex flex-col items-center relative overflow-hidden h-[500px] border-none select-none">
+      <div className="absolute top-6 left-8 flex justify-between w-[calc(100%-4rem)] items-center z-20">
+        <div>
+          <h3 className="text-xs uppercase font-bold text-white/40 tracking-widest">Zen Bubble Pop</h3>
+          <p className="text-[10px] text-[#4FC3F7] uppercase font-black tracking-widest mt-1">Tap or hover over bubbles to release harmonic chimes</p>
+        </div>
+        <div className="bg-[#4FC3F7]/10 border border-[#4FC3F7]/30 px-4 py-1.5 rounded-full text-xs font-mono font-bold text-[#4FC3F7]">
+          POPS: {score}
+        </div>
+      </div>
+
+      <div
+        ref={containerRef}
+        className="w-full h-full relative mt-12 bg-black/20 rounded-3xl overflow-hidden border border-white/5 cursor-crosshair"
+      >
+        {bubbles.map(bubble => (
+          <motion.div
+            key={bubble.id}
+            onMouseEnter={() => handlePop(bubble.id)}
+            onClick={() => handlePop(bubble.id)}
+            style={{
+              position: 'absolute',
+              left: `${bubble.x}%`,
+              top: `${bubble.y}%`,
+              width: `${bubble.size}px`,
+              height: `${bubble.size}px`,
+              backgroundColor: bubble.color,
+              borderColor: 'rgba(255, 255, 255, 0.4)',
+              borderWidth: '1px',
+              borderRadius: '50%',
+              transform: 'translate(-50%, -50%)',
+              boxShadow: '0 0 15px rgba(255,255,255,0.05), inset 0 0 10px rgba(255,255,255,0.2)',
+            }}
+            whileHover={{ scale: 1.2 }}
+            className="transition-transform duration-75 select-none"
+          />
+        ))}
+      </div>
+    </Card>
+  );
+};
+
+const ZenDrawGame = () => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawColor, setDrawColor] = useState('#4FC3F7');
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (parent) {
+        canvas.width = parent.clientWidth;
+        canvas.height = 420;
+        ctx.fillStyle = '#0a0a0a';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    };
+    
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+
+    const interval = setInterval(() => {
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.08)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }, 50);
+
+    return () => {
+      window.removeEventListener('resize', resizeCanvas);
+      clearInterval(interval);
+    };
+  }, []);
+
+  const drawSymmetric = (x: number, y: number, lastX: number, lastY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+
+    const relX = x - centerX;
+    const relY = y - centerY;
+    const relLastX = lastX - centerX;
+    const relLastY = lastY - centerY;
+
+    const symmetries = 8;
+    const angleStep = (2 * Math.PI) / symmetries;
+
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = drawColor;
+    ctx.strokeStyle = drawColor;
+
+    for (let i = 0; i < symmetries; i++) {
+      ctx.beginPath();
+      
+      const angle = i * angleStep;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+
+      const rotX = relX * cosA - relY * sinA;
+      const rotY = relX * sinA + relY * cosA;
+      const rotLastX = relLastX * cosA - relLastY * sinA;
+      const rotLastY = relLastX * sinA + relLastY * cosA;
+
+      ctx.moveTo(centerX + rotLastX, centerY + rotLastY);
+      ctx.lineTo(centerX + rotX, centerY + rotY);
+      ctx.stroke();
+
+      const mirrorRotX = relX * cosA - (-relY) * sinA;
+      const mirrorRotY = relX * sinA + (-relY) * cosA;
+      const mirrorRotLastX = relLastX * cosA - (-relLastY) * sinA;
+      const mirrorRotLastY = relLastX * sinA + (-relLastY) * cosA;
+
+      ctx.beginPath();
+      ctx.moveTo(centerX + mirrorRotLastX, centerY + mirrorRotLastY);
+      ctx.lineTo(centerX + mirrorRotX, centerY + mirrorRotY);
+      ctx.stroke();
+    }
+  };
+
+  const handlePointerDown = () => {
+    setIsDrawing(true);
+  };
+
+  const handlePointerUp = () => {
+    setIsDrawing(false);
+  };
+
+  const lastPos = useRef<{ x: number; y: number } | null>(null);
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    const rect = canvas.getBoundingClientRect();
+    const currentX = e.clientX - rect.left;
+    const currentY = e.clientY - rect.top;
+
+    if (isDrawing && lastPos.current) {
+      drawSymmetric(currentX, currentY, lastPos.current.x, lastPos.current.y);
+    }
+    
+    lastPos.current = { x: currentX, y: currentY };
+  };
+
+  const clearCanvas = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const colors = [
+    { value: '#4FC3F7', label: 'Sky' },
+    { value: '#f06292', label: 'Rose' },
+    { value: '#ba68c8', label: 'Orchid' },
+    { value: '#4dd0e1', label: 'Teal' },
+    { value: '#ffd54f', label: 'Amber' },
+    { value: '#aed581', label: 'Mint' }
+  ];
+
+  return (
+    <Card className="glass-card p-8 flex flex-col items-center relative overflow-hidden h-[520px] border-none select-none">
+      <div className="absolute top-6 left-8 flex justify-between w-[calc(100%-4rem)] items-center z-20 pointer-events-none">
+        <div>
+          <h3 className="text-xs uppercase font-bold text-white/40 tracking-widest">Kaleidoscope Flow</h3>
+          <p className="text-[10px] text-[#4FC3F7] uppercase font-black tracking-widest mt-1">Move your cursor to paint radial symmetric light trails</p>
+        </div>
+      </div>
+
+      <div className="w-full flex justify-end gap-3 mt-12 z-20 relative mb-4">
+        <div className="flex gap-2 mr-auto items-center">
+          {colors.map(c => (
+            <button
+              key={c.value}
+              onClick={() => setDrawColor(c.value)}
+              style={{ backgroundColor: c.value }}
+              className={`w-6 h-6 rounded-full border transition-all ${drawColor === c.value ? 'scale-125 border-white ring-2 ring-[#4FC3F7]/50' : 'border-transparent hover:scale-110'}`}
+              title={c.label}
+            />
+          ))}
+        </div>
+        <button
+          onClick={clearCanvas}
+          className="px-4 py-1 text-[10px] border border-white/20 hover:border-[#4FC3F7] hover:text-[#4FC3F7] font-black uppercase tracking-widest rounded-xl transition-all"
+        >
+          Clear Grid
+        </button>
+      </div>
+
+      <div className="w-full flex-1 relative bg-[#0a0a0a] rounded-3xl overflow-hidden border border-white/5 shadow-inner">
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onPointerLeave={handlePointerUp}
+          onPointerMove={handlePointerMove}
+          className="absolute inset-0 cursor-crosshair touch-none"
+        />
+      </div>
+    </Card>
+  );
+};
+
+interface SoundItem {
+  id: string;
+  name: string;
+  emoji: string;
+  color: string;
+  desc: string;
+}
+
+const SoundBathSoundboard = () => {
+  const [activeSounds, setActiveSounds] = useState<Record<string, boolean>>({});
+  const audioNodes = useRef<Record<string, { oscNodes?: OscillatorNode[]; noiseNode?: AudioBufferSourceNode; gainNode: GainNode; audioCtx: AudioContext }>>({});
+
+  const sounds: SoundItem[] = [
+    { id: 'rain', name: 'Gentle Rain', emoji: '🌧️', color: 'rgba(79, 195, 247, 0.2)', desc: 'Soothing white noise sweep simulating falling droplets.' },
+    { id: 'ocean', name: 'Ocean Waves', emoji: '🌊', color: 'rgba(77, 208, 176, 0.2)', desc: 'Rhythmic filtered waves swelling in and out.' },
+    { id: 'bowl', name: 'Tibetan Bowl', emoji: '🥣', color: 'rgba(255, 213, 79, 0.2)', desc: 'Resonating pure harmonics that clear mental chatter.' },
+    { id: 'wind', name: 'Forest Wind', emoji: '🍃', color: 'rgba(174, 213, 129, 0.2)', desc: 'Breezy bandpass sweeps simulating leaf rustles.' },
+    { id: 'space', name: 'Deep Space', emoji: '🛸', color: 'rgba(186, 104, 200, 0.2)', desc: 'Low frequency cosmic drone for ground alignment.' }
+  ];
+
+  const createNoiseBuffer = (audioCtx: AudioContext) => {
+    const bufferSize = 2 * audioCtx.sampleRate;
+    const noiseBuffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const output = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      output[i] = Math.random() * 2 - 1;
+    }
+    return noiseBuffer;
+  };
+
+  const startSound = (id: string) => {
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const mainGain = audioCtx.createGain();
+      mainGain.connect(audioCtx.destination);
+      mainGain.gain.setValueAtTime(0.001, audioCtx.currentTime);
+      
+      const nodes: any = { gainNode: mainGain, audioCtx };
+
+      if (id === 'rain') {
+        const noise = audioCtx.createBufferSource();
+        noise.buffer = createNoiseBuffer(audioCtx);
+        noise.loop = true;
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(800, audioCtx.currentTime);
+
+        noise.connect(filter);
+        filter.connect(mainGain);
+        noise.start();
+        
+        mainGain.gain.exponentialRampToValueAtTime(0.2, audioCtx.currentTime + 1.5);
+        nodes.noiseNode = noise;
+      } 
+      else if (id === 'ocean') {
+        const noise = audioCtx.createBufferSource();
+        noise.buffer = createNoiseBuffer(audioCtx);
+        noise.loop = true;
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.setValueAtTime(350, audioCtx.currentTime);
+        filter.Q.setValueAtTime(1.0, audioCtx.currentTime);
+
+        const lfo = audioCtx.createOscillator();
+        lfo.type = 'sine';
+        lfo.frequency.setValueAtTime(0.12, audioCtx.currentTime);
+
+        const lfoGain = audioCtx.createGain();
+        lfoGain.gain.setValueAtTime(150, audioCtx.currentTime);
+
+        lfo.connect(lfoGain);
+        lfoGain.connect(filter.frequency);
+        lfo.start();
+
+        noise.connect(filter);
+        filter.connect(mainGain);
+        noise.start();
+
+        mainGain.gain.exponentialRampToValueAtTime(0.35, audioCtx.currentTime + 1.5);
+        nodes.noiseNode = noise;
+        nodes.oscNodes = [lfo];
+      }
+      else if (id === 'bowl') {
+        const fund = 220;
+        const harmonics = [1, 2.01, 3.02, 4.04];
+        const oscs: OscillatorNode[] = [];
+
+        harmonics.forEach((h, index) => {
+          const osc = audioCtx.createOscillator();
+          const oscGain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(fund * h, audioCtx.currentTime);
+          
+          const lfo = audioCtx.createOscillator();
+          lfo.type = 'sine';
+          lfo.frequency.setValueAtTime(2.5 + index * 0.4, audioCtx.currentTime);
+          const lfoG = audioCtx.createGain();
+          lfoG.gain.setValueAtTime(3, audioCtx.currentTime);
+          
+          lfo.connect(lfoG);
+          lfoG.connect(osc.frequency);
+          lfo.start();
+          oscs.push(lfo);
+
+          oscGain.gain.setValueAtTime(0.12 / (index + 1), audioCtx.currentTime);
+          osc.connect(oscGain);
+          oscGain.connect(mainGain);
+          osc.start();
+          oscs.push(osc);
+        });
+
+        mainGain.gain.exponentialRampToValueAtTime(0.4, audioCtx.currentTime + 2.0);
+        nodes.oscNodes = oscs;
+      }
+      else if (id === 'wind') {
+        const noise = audioCtx.createBufferSource();
+        noise.buffer = createNoiseBuffer(audioCtx);
+        noise.loop = true;
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.Q.setValueAtTime(4.0, audioCtx.currentTime);
+
+        const lfo = audioCtx.createOscillator();
+        lfo.type = 'sine';
+        lfo.frequency.setValueAtTime(0.08, audioCtx.currentTime);
+
+        const lfoGain = audioCtx.createGain();
+        lfoGain.gain.setValueAtTime(280, audioCtx.currentTime);
+
+        lfo.connect(lfoGain);
+        lfoGain.connect(filter.frequency);
+        lfo.start();
+
+        filter.frequency.setValueAtTime(600, audioCtx.currentTime);
+
+        noise.connect(filter);
+        filter.connect(mainGain);
+        noise.start();
+
+        mainGain.gain.exponentialRampToValueAtTime(0.18, audioCtx.currentTime + 1.5);
+        nodes.noiseNode = noise;
+        nodes.oscNodes = [lfo];
+      }
+      else if (id === 'space') {
+        const freqs = [55, 110, 165];
+        const oscs: OscillatorNode[] = [];
+
+        freqs.forEach((f, index) => {
+          const osc = audioCtx.createOscillator();
+          const oscGain = audioCtx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(f, audioCtx.currentTime);
+
+          const lfo = audioCtx.createOscillator();
+          lfo.type = 'sine';
+          lfo.frequency.setValueAtTime(0.05 + index * 0.02, audioCtx.currentTime);
+          const lfoG = audioCtx.createGain();
+          lfoG.gain.setValueAtTime(1.5, audioCtx.currentTime);
+
+          lfo.connect(lfoG);
+          lfoG.connect(osc.frequency);
+          lfo.start();
+          oscs.push(lfo);
+
+          oscGain.gain.setValueAtTime(0.25 / (index + 1), audioCtx.currentTime);
+          osc.connect(oscGain);
+          oscGain.connect(mainGain);
+          osc.start();
+          oscs.push(osc);
+        });
+
+        mainGain.gain.exponentialRampToValueAtTime(0.4, audioCtx.currentTime + 2.0);
+        nodes.oscNodes = oscs;
+      }
+
+      audioNodes.current[id] = nodes;
+    } catch (e) {
+      console.warn("Sound synthesis failed:", e);
+    }
+  };
+
+  const stopSound = (id: string) => {
+    const nodes = audioNodes.current[id];
+    if (!nodes) return;
+
+    try {
+      const { gainNode, oscNodes, noiseNode, audioCtx } = nodes;
+      
+      gainNode.gain.setValueAtTime(gainNode.gain.value, audioCtx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 1.5);
+
+      setTimeout(() => {
+        if (noiseNode) {
+          try { (noiseNode as AudioBufferSourceNode).stop(); } catch {}
+        }
+        if (oscNodes) {
+          oscNodes.forEach(o => { try { o.stop(); } catch {} });
+        }
+        audioCtx.close();
+      }, 1600);
+
+      delete audioNodes.current[id];
+    } catch (e) {
+      console.warn("Sound stop failed:", e);
+    }
+  };
+
+  const toggleSound = (id: string) => {
+    const isActive = !!activeSounds[id];
+    setActiveSounds(prev => ({ ...prev, [id]: !isActive }));
+    
+    if (isActive) {
+      stopSound(id);
+    } else {
+      startSound(id);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      Object.keys(audioNodes.current).forEach(id => {
+        const nodes = audioNodes.current[id];
+        if (nodes) {
+          nodes.oscNodes?.forEach(o => { try { o.stop(); } catch {} });
+          if (nodes.noiseNode) {
+            try { (nodes.noiseNode as AudioBufferSourceNode).stop(); } catch {}
+          }
+          nodes.audioCtx.close();
+        }
+      });
+    };
+  }, []);
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h3 className="text-xs uppercase font-bold text-white/40 tracking-widest">Ambient Sound Bath</h3>
+        <p className="text-[10px] text-[#4FC3F7] uppercase font-black tracking-widest mt-1">Toggle cards to overlay real-time synthesized soothing noise frequencies</p>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+        {sounds.map(sound => {
+          const isActive = !!activeSounds[sound.id];
+          return (
+            <div
+              key={sound.id}
+              onClick={() => toggleSound(sound.id)}
+              style={{
+                backgroundColor: isActive ? sound.color : 'rgba(255, 255, 255, 0.02)',
+                borderColor: isActive ? '#4FC3F7' : 'rgba(255, 255, 255, 0.08)'
+              }}
+              className="border p-6 rounded-3xl cursor-pointer hover:border-white/20 hover:scale-[1.02] transition-all flex flex-col justify-between h-[160px] group select-none"
+            >
+              <div className="flex justify-between items-start">
+                <span className="text-3xl">{sound.emoji}</span>
+                <span
+                  className={`text-[8px] font-black uppercase tracking-widest px-3 py-1 rounded-full border ${isActive ? 'bg-[#4FC3F7] text-black border-transparent' : 'text-white/30 border-white/5 bg-white/2 group-hover:text-white/60'}`}
+                >
+                  {isActive ? 'Active' : 'Mute'}
+                </span>
+              </div>
+              <div>
+                <h4 className="font-bold text-lg text-white mb-1 group-hover:text-[#4FC3F7] transition-colors">{sound.name}</h4>
+                <p className="text-[9px] text-white/40 leading-relaxed font-semibold uppercase tracking-tight">{sound.desc}</p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+interface Koi {
+  id: number;
+  x: number;
+  y: number;
+  angle: number;
+  speed: number;
+  size: number;
+  color: string;
+  tailPhase: number;
+}
+
+interface Ripple {
+  id: number;
+  x: number;
+  y: number;
+  radius: number;
+  maxRadius: number;
+  alpha: number;
+}
+
+interface Food {
+  id: number;
+  x: number;
+  y: number;
+}
+
+const KoiRipplePondGame = () => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [foodCount, setFoodCount] = useState(0);
+  const koiList = useRef<Koi[]>([]);
+  const ripplesList = useRef<Ripple[]>([]);
+  const foodsList = useRef<Food[]>([]);
+  const mousePos = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    const colors = [
+      '#FF7043',
+      '#FFCA28',
+      '#EC407A',
+      '#26A69A',
+      '#AB47BC'
+    ];
+    const initialKoi: Koi[] = Array.from({ length: 6 }, (_, i) => ({
+      id: i,
+      x: Math.random() * 500 + 100,
+      y: Math.random() * 300 + 100,
+      angle: Math.random() * Math.PI * 2,
+      speed: Math.random() * 0.8 + 0.6,
+      size: Math.random() * 8 + 14,
+      color: colors[i % colors.length],
+      tailPhase: Math.random() * 10
+    }));
+    koiList.current = initialKoi;
+  }, []);
+
+  const playPondSound = (frequency: number) => {
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, audioCtx.currentTime);
+      
+      gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.8);
+      
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.8);
+    } catch {
+      // Audio context blocked
+    }
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animFrameId: number;
+
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (parent) {
+        canvas.width = parent.clientWidth;
+        canvas.height = 420;
+      }
+    };
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+
+    const updateAndDraw = () => {
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.25)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = 'rgba(79, 195, 247, 0.02)';
+      ctx.lineWidth = 1;
+      const gridSize = 40;
+      for (let x = 0; x < canvas.width; x += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y < canvas.height; y += gridSize) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+
+      ripplesList.current = ripplesList.current
+        .map(r => ({
+          ...r,
+          radius: r.radius + 1.8,
+          alpha: Math.max(0, 1 - r.radius / r.maxRadius)
+        }))
+        .filter(r => r.alpha > 0);
+
+      ripplesList.current.forEach(r => {
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(79, 195, 247, ${r.alpha * 0.35})`;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.radius * 0.7, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(79, 195, 247, ${r.alpha * 0.15})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      });
+
+      foodsList.current.forEach(f => {
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#aed581';
+        ctx.shadowColor = '#aed581';
+        ctx.shadowBlur = 10;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      });
+
+      koiList.current = koiList.current.map(k => {
+        let targetX = k.x + Math.cos(k.angle) * 100;
+        let targetY = k.y + Math.sin(k.angle) * 100;
+
+        if (foodsList.current.length > 0) {
+          let closestFood = foodsList.current[0];
+          let minDist = Infinity;
+          foodsList.current.forEach(f => {
+            const dist = Math.hypot(f.x - k.x, f.y - k.y);
+            if (dist < minDist) {
+              minDist = dist;
+              closestFood = f;
+            }
+          });
+
+          if (minDist < 15) {
+            foodsList.current = foodsList.current.filter(f => f.id !== closestFood.id);
+            setFoodCount(foodsList.current.length);
+            playPondSound(523.25);
+            k.speed = Math.random() * 0.8 + 1.2;
+          } else {
+            targetX = closestFood.x;
+            targetY = closestFood.y;
+            k.speed = 1.4;
+          }
+        } else if (mousePos.current) {
+          const distToMouse = Math.hypot(mousePos.current.x - k.x, mousePos.current.y - k.y);
+          if (distToMouse < 250) {
+            targetX = mousePos.current.x;
+            targetY = mousePos.current.y;
+            k.speed = distToMouse < 60 ? 0.5 : 1.0;
+          } else {
+            k.speed = Math.max(0.6, k.speed - 0.02);
+          }
+        } else {
+          k.speed = Math.max(0.6, k.speed - 0.02);
+          if (Math.random() < 0.02) {
+            k.angle += (Math.random() - 0.5) * 1.5;
+          }
+        }
+
+        const angleToTarget = Math.atan2(targetY - k.y, targetX - k.x);
+        
+        let angleDiff = angleToTarget - k.angle;
+        while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        k.angle += angleDiff * 0.06;
+
+        let nextX = k.x + Math.cos(k.angle) * k.speed;
+        let nextY = k.y + Math.sin(k.angle) * k.speed;
+
+        if (nextX < 20 || nextX > canvas.width - 20) {
+          k.angle = Math.PI - k.angle;
+          nextX = k.x + Math.cos(k.angle) * k.speed;
+        }
+        if (nextY < 20 || nextY > canvas.height - 20) {
+          k.angle = -k.angle;
+          nextY = k.y + Math.sin(k.angle) * k.speed;
+        }
+
+        k.x = nextX;
+        k.y = nextY;
+        k.tailPhase += 0.12 * k.speed + 0.05;
+
+        ctx.save();
+        ctx.translate(k.x, k.y);
+        ctx.rotate(k.angle);
+
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = k.color;
+
+        ctx.fillStyle = k.color;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, k.size, k.size * 0.45, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.beginPath();
+        ctx.ellipse(k.size * 0.4, 0, k.size * 0.3, k.size * 0.2, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(k.size * 0.5, -k.size * 0.25, 2, 0, Math.PI * 2);
+        ctx.arc(k.size * 0.5, k.size * 0.25, 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = k.color + '88';
+        ctx.beginPath();
+        ctx.ellipse(-k.size * 0.15, -k.size * 0.45, k.size * 0.4, k.size * 0.15, -Math.PI / 4, 0, Math.PI * 2);
+        ctx.ellipse(-k.size * 0.15, k.size * 0.45, k.size * 0.4, k.size * 0.15, Math.PI / 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        const wiggle = Math.sin(k.tailPhase) * 12;
+        ctx.beginPath();
+        ctx.moveTo(-k.size * 0.7, 0);
+        ctx.quadraticCurveTo(-k.size * 1.1, wiggle * 0.5, -k.size * 1.4, wiggle);
+        ctx.lineTo(-k.size * 1.35, wiggle + k.size * 0.25);
+        ctx.quadraticCurveTo(-k.size * 1.0, wiggle * 0.2, -k.size * 0.7, 0);
+        ctx.fillStyle = k.color + 'aa';
+        ctx.fill();
+
+        ctx.restore();
+
+        return k;
+      });
+
+      animFrameId = requestAnimationFrame(updateAndDraw);
+    };
+
+    animFrameId = requestAnimationFrame(updateAndDraw);
+
+    return () => {
+      window.removeEventListener('resize', resizeCanvas);
+      cancelAnimationFrame(animFrameId);
+    };
+  }, []);
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+
+    const rId = Date.now() + Math.random();
+    ripplesList.current.push({
+      id: rId,
+      x: clickX,
+      y: clickY,
+      radius: 0,
+      maxRadius: Math.random() * 60 + 120,
+      alpha: 1.0
+    });
+
+    const fId = Date.now() + Math.random();
+    foodsList.current.push({
+      id: fId,
+      x: clickX,
+      y: clickY
+    });
+    setFoodCount(foodsList.current.length);
+
+    const pitches = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25];
+    const randomPitch = pitches[Math.floor(Math.random() * pitches.length)];
+    playPondSound(randomPitch);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    mousePos.current = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  const handlePointerLeave = () => {
+    mousePos.current = null;
+  };
+
+  const clearFood = () => {
+    foodsList.current = [];
+    setFoodCount(0);
+  };
+
+  return (
+    <Card className="glass-card p-8 flex flex-col items-center relative overflow-hidden h-[520px] border-none select-none">
+      <div className="absolute top-6 left-8 flex justify-between w-[calc(100%-4rem)] items-center z-20 pointer-events-none">
+        <div>
+          <h3 className="text-xs uppercase font-bold text-white/40 tracking-widest">Koi Ripple Pond</h3>
+          <p className="text-[10px] text-[#4FC3F7] uppercase font-black tracking-widest mt-1">Tap the water to release ripples, drop food, and attract glowing koi fish</p>
+        </div>
+      </div>
+
+      <div className="w-full flex justify-end gap-3 mt-12 z-20 relative mb-4">
+        {foodCount > 0 && (
+          <div className="bg-[#aed581]/15 border border-[#aed581]/30 px-4 py-1.5 rounded-full text-[10px] font-bold text-[#aed581] mr-auto flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 bg-[#aed581] rounded-full animate-ping"></span>
+            ACTIVE FOOD: {foodCount}
+          </div>
+        )}
+        <button
+          onClick={clearFood}
+          className="px-4 py-1 text-[10px] border border-white/20 hover:border-red-400 hover:text-red-400 font-black uppercase tracking-widest rounded-xl transition-all"
+        >
+          Clear Food
+        </button>
+      </div>
+
+      <div className="w-full flex-1 relative bg-[#070b0c] rounded-3xl overflow-hidden border border-white/5 shadow-inner">
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerLeave={handlePointerLeave}
+          className="absolute inset-0 cursor-pointer touch-none"
+        />
+      </div>
+    </Card>
+  );
+};
+
+interface HarpString {
+  x: number;
+  frequency: number;
+  name: string;
+  color: string;
+  lastPluckTime: number;
+  amplitude: number;
+}
+
+const HarpOfLightGame = () => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [synthWave, setSynthWave] = useState<'sine' | 'triangle' | 'sawtooth'>('triangle');
+  const stringsRef = useRef<HarpString[]>([]);
+  const lastMouseX = useRef<number | null>(null);
+  const isStrumming = useRef(false);
+
+  useEffect(() => {
+    const pentatonicScale = [
+      { name: 'C4', freq: 261.63, color: '#FF7043' },
+      { name: 'D4', freq: 293.66, color: '#FFCA28' },
+      { name: 'E4', freq: 329.63, color: '#9CCC65' },
+      { name: 'G4', freq: 392.00, color: '#26A69A' },
+      { name: 'A4', freq: 440.00, color: '#29B6F6' },
+      { name: 'C5', freq: 523.25, color: '#AB47BC' },
+      { name: 'D5', freq: 587.33, color: '#EC407A' },
+      { name: 'E5', freq: 659.25, color: '#FFA726' }
+    ];
+    stringsRef.current = pentatonicScale.map((note) => ({
+      x: 0,
+      frequency: note.freq,
+      name: note.name,
+      color: note.color,
+      lastPluckTime: 0,
+      amplitude: 0
+    }));
+  }, []);
+
+  const playHarpNote = (freq: number) => {
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const filter = audioCtx.createBiquadFilter();
+
+      osc.type = synthWave;
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(1200, audioCtx.currentTime);
+      filter.frequency.exponentialRampToValueAtTime(300, audioCtx.currentTime + 1.2);
+
+      gain.gain.setValueAtTime(0.001, audioCtx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.18, audioCtx.currentTime + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 2.0);
+
+      osc.connect(filter);
+      filter.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      osc.start();
+      osc.stop(audioCtx.currentTime + 2.1);
+    } catch {
+      // Audio context blocked
+    }
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animFrameId: number;
+
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (parent) {
+        canvas.width = parent.clientWidth;
+        canvas.height = 420;
+      }
+    };
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+
+    const drawHarp = () => {
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const margin = 60;
+      const step = (canvas.width - margin * 2) / (stringsRef.current.length - 1 || 1);
+
+      stringsRef.current.forEach((str, index) => {
+        str.x = margin + index * step;
+
+        const elapsed = Date.now() - str.lastPluckTime;
+        if (elapsed < 1500) {
+          str.amplitude = Math.sin(elapsed * 0.05) * 20 * Math.max(0, 1 - elapsed / 1500);
+        } else {
+          str.amplitude = 0;
+        }
+
+        ctx.beginPath();
+        if (str.amplitude !== 0) {
+          ctx.moveTo(str.x, 0);
+          for (let y = 0; y <= canvas.height; y += 10) {
+            const waveOffset = Math.sin((y / canvas.height) * Math.PI) * str.amplitude;
+            ctx.lineTo(str.x + waveOffset, y);
+          }
+        } else {
+          ctx.moveTo(str.x, 0);
+          ctx.lineTo(str.x, canvas.height);
+        }
+
+        ctx.strokeStyle = str.color;
+        ctx.lineWidth = str.amplitude !== 0 ? 3.5 : 1.5;
+        ctx.shadowBlur = str.amplitude !== 0 ? 20 : 6;
+        ctx.shadowColor = str.color;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.font = '9px monospace';
+        ctx.fillText(str.name, str.x - 6, canvas.height - 20);
+      });
+
+      animFrameId = requestAnimationFrame(drawHarp);
+    };
+
+    animFrameId = requestAnimationFrame(drawHarp);
+
+    return () => {
+      window.removeEventListener('resize', resizeCanvas);
+      cancelAnimationFrame(animFrameId);
+    };
+  }, [synthWave]);
+
+  const handlePointerDown = () => {
+    isStrumming.current = true;
+  };
+
+  const handlePointerUp = () => {
+    isStrumming.current = false;
+    lastMouseX.current = null;
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!isStrumming.current) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const currentX = e.clientX - rect.left;
+
+    if (lastMouseX.current !== null) {
+      const minX = Math.min(lastMouseX.current, currentX);
+      const maxX = Math.max(lastMouseX.current, currentX);
+
+      stringsRef.current.forEach(str => {
+        if (str.x >= minX && str.x <= maxX) {
+          const now = Date.now();
+          if (now - str.lastPluckTime > 150) {
+            str.lastPluckTime = now;
+            playHarpNote(str.frequency);
+          }
+        }
+      });
+    }
+
+    lastMouseX.current = currentX;
+  };
+
+  return (
+    <Card className="glass-card p-8 flex flex-col items-center relative overflow-hidden h-[520px] border-none select-none">
+      <div className="absolute top-6 left-8 flex justify-between w-[calc(100%-4rem)] items-center z-20 pointer-events-none">
+        <div>
+          <h3 className="text-xs uppercase font-bold text-white/40 tracking-widest">Harp of Light</h3>
+          <p className="text-[10px] text-[#4FC3F7] uppercase font-black tracking-widest mt-1">Press down and drag your cursor across strings to play pentatonic harmonies</p>
+        </div>
+      </div>
+
+      <div className="w-full flex justify-end gap-3 mt-12 z-20 relative mb-4">
+        <div className="flex gap-2 mr-auto items-center">
+          <span className="text-[9px] uppercase font-bold text-white/40 mr-2">VOICE:</span>
+          {['sine', 'triangle', 'sawtooth'].map(wave => (
+            <button
+              key={wave}
+              onClick={() => setSynthWave(wave as any)}
+              className={`px-3 py-1 rounded-xl text-[9px] uppercase font-bold transition-all border ${synthWave === wave ? 'bg-[#4FC3F7] text-black border-transparent shadow-[0_0_10px_#4FC3F766]' : 'bg-white/5 border-white/10 hover:border-white/20 hover:text-white text-white/40'}`}
+            >
+              {wave}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="w-full flex-1 relative bg-[#0a0a0a] rounded-3xl overflow-hidden border border-white/5 shadow-inner">
+        <canvas
+          ref={canvasRef}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onPointerLeave={handlePointerUp}
+          onPointerMove={handlePointerMove}
+          className="absolute inset-0 cursor-ew-resize touch-none"
+        />
+      </div>
+    </Card>
+  );
+};
+
 const BreathingPage = ({ emotion, history }: { emotion: Emotion | null, history: any[] }) => {
   const [phase, setPhase] = useState<'inhale' | 'hold' | 'exhale'>('inhale');
   const [seconds, setSeconds] = useState(4);
@@ -1598,59 +2827,100 @@ const BreathingPage = ({ emotion, history }: { emotion: Emotion | null, history:
   };
 
   return (
-    <div className="grid grid-cols-12 gap-6 min-h-[400px]">
-      <div className="col-span-12 lg:col-span-8 glass-card p-12 flex flex-col items-center justify-center relative overflow-hidden">
-        <h3 className="absolute top-8 left-12 text-xs uppercase font-bold text-white/40 tracking-widest">Core Breathing Guide</h3>
-
-        <div className="relative flex items-center justify-center w-64 h-64">
-          <div className="absolute inset-0 rounded-full border-2 border-dashed border-[#4FC3F7]/20 animate-spin-slow"></div>
-          {/* Expanded circle mock */}
-          <motion.div
-            animate={{
-              scale: phase === 'inhale' ? 1.5 : phase === 'exhale' ? 1 : 1.5,
-              opacity: phase === 'hold' ? 0.8 : 1
-            }}
-            transition={{ duration: 4, ease: "easeInOut" }}
-            className="w-32 h-32 bg-[#4FC3F7]/20 rounded-full border border-[#4FC3F7] shadow-[0_0_50px_#4FC3F744] flex flex-col items-center justify-center"
-          >
-            <span className="text-xs font-bold text-[#4FC3F7] uppercase tracking-widest">{phase}</span>
-            <span className="text-2xl font-bold text-white mt-1">{seconds}</span>
-          </motion.div>
+    <div className="space-y-8 pb-12">
+      <header className="px-1 flex justify-between items-end">
+        <div>
+          <h2 className="text-3xl font-bold">Relaxation Lounge</h2>
+          <p className="text-sm text-white/40 uppercase tracking-widest font-semibold mt-1">Calm your mind. Center your body.</p>
         </div>
+      </header>
 
-        <p className="mt-12 text-center text-sm text-white/50 max-w-sm italic">
-          "Focus on the rhythm of the circle. Let each breath center your consciousness and calm your autonomic nervous system."
-        </p>
-      </div>
+      <Tabs defaultValue="breath" className="w-full">
+        <TabsList className="bg-white/5 border border-white/10 rounded-2xl p-1 mb-8 flex flex-wrap h-auto">
+          <TabsTrigger value="breath" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🧘 Breathing Guide</TabsTrigger>
+          <TabsTrigger value="bubble" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🎈 Zen Bubble Pop</TabsTrigger>
+          <TabsTrigger value="draw" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🎨 Kaleidoscope Flow</TabsTrigger>
+          <TabsTrigger value="sound" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🔊 Ambient Sound Bath</TabsTrigger>
+          <TabsTrigger value="pond" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🐟 Koi Ripple Pond</TabsTrigger>
+          <TabsTrigger value="harp" className="rounded-xl px-6 py-3 text-xs uppercase font-black tracking-widest data-active:bg-[#4FC3F7] data-active:text-black">🎼 Harp of Light</TabsTrigger>
+        </TabsList>
 
-      <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
-        <Card className="glass-card p-6 flex flex-col items-center justify-center h-full">
-          <div className="flex justify-between w-full text-center px-4">
-            <div>
-              <div className="text-3xl font-bold">3</div>
-              <div className="text-[10px] text-white/40 uppercase font-bold">Day Streak</div>
+        <TabsContent value="breath" className="space-y-6 outline-none">
+          <div className="grid grid-cols-12 gap-6 min-h-[400px]">
+            <div className="col-span-12 lg:col-span-8 glass-card p-12 flex flex-col items-center justify-center relative overflow-hidden min-h-[420px]">
+              <h3 className="absolute top-8 left-12 text-xs uppercase font-bold text-white/40 tracking-widest">Core Breathing Guide</h3>
+
+              <div className="relative flex items-center justify-center w-64 h-64 mt-6">
+                <div className="absolute inset-0 rounded-full border-2 border-dashed border-[#4FC3F7]/20 animate-spin-slow"></div>
+                <motion.div
+                  animate={{
+                    scale: phase === 'inhale' ? 1.5 : phase === 'exhale' ? 1 : 1.5,
+                    opacity: phase === 'hold' ? 0.8 : 1
+                  }}
+                  transition={{ duration: 4, ease: "easeInOut" }}
+                  className="w-32 h-32 bg-[#4FC3F7]/20 rounded-full border border-[#4FC3F7] shadow-[0_0_50px_#4FC3F744] flex flex-col items-center justify-center"
+                >
+                  <span className="text-xs font-bold text-[#4FC3F7] uppercase tracking-widest">{phase}</span>
+                  <span className="text-2xl font-bold text-white mt-1">{seconds}</span>
+                </motion.div>
+              </div>
+
+              <p className="mt-12 text-center text-sm text-white/50 max-w-sm italic">
+                "Focus on the rhythm of the circle. Let each breath center your consciousness and calm your autonomic nervous system."
+              </p>
             </div>
-            <div className="w-[1px] h-10 bg-white/10"></div>
-            <div>
-              <div className="text-3xl font-bold text-[#4FC3F7]">{history.length}</div>
-              <div className="text-[10px] text-white/40 uppercase font-bold">Total Sessions</div>
+
+            <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
+              <Card className="glass-card p-6 flex flex-col items-center justify-center h-full min-h-[420px]">
+                <div className="flex justify-between w-full text-center px-4">
+                  <div>
+                    <div className="text-3xl font-bold">3</div>
+                    <div className="text-[10px] text-white/40 uppercase font-bold">Day Streak</div>
+                  </div>
+                  <div className="w-[1px] h-10 bg-white/10"></div>
+                  <div>
+                    <div className="text-3xl font-bold text-[#4FC3F7]">{history.length}</div>
+                    <div className="text-[10px] text-white/40 uppercase font-bold">Total Sessions</div>
+                  </div>
+                </div>
+
+                <div className="mt-8 w-full pt-8 border-t border-white/10">
+                  <h4 className="text-[10px] uppercase font-bold text-white/30 mb-4 text-center tracking-widest">Clinical Progress</h4>
+                  <div className="flex items-end gap-2 h-24 px-2">
+                    {[40, 60, 30, 90, 50, 80, 20].map((h, i) => (
+                      <div
+                        key={i}
+                        className={`flex-1 rounded-t-sm transition-all hover:bg-[#4FC3F7]/60 ${i === 5 ? 'bg-[#4FC3F7]' : 'bg-white/5'}`}
+                        style={{ height: `${h}%` }}
+                      ></div>
+                    ))}
+                  </div>
+                </div>
+              </Card>
             </div>
           </div>
+        </TabsContent>
 
-          <div className="mt-8 w-full pt-8 border-t border-white/10">
-            <h4 className="text-[10px] uppercase font-bold text-white/30 mb-4 text-center tracking-widest">Clinical Progress</h4>
-            <div className="flex items-end gap-2 h-24 px-2">
-              {[40, 60, 30, 90, 50, 80, 20].map((h, i) => (
-                <div
-                  key={i}
-                  className={`flex-1 rounded-t-sm transition-all hover:bg-[#4FC3F7]/60 ${i === 5 ? 'bg-[#4FC3F7]' : 'bg-white/5'}`}
-                  style={{ height: `${h}%` }}
-                ></div>
-              ))}
-            </div>
-          </div>
-        </Card>
-      </div>
+        <TabsContent value="bubble" className="outline-none">
+          <ZenBubblePopGame />
+        </TabsContent>
+
+        <TabsContent value="draw" className="outline-none">
+          <ZenDrawGame />
+        </TabsContent>
+
+        <TabsContent value="sound" className="outline-none">
+          <SoundBathSoundboard />
+        </TabsContent>
+
+        <TabsContent value="pond" className="outline-none">
+          <KoiRipplePondGame />
+        </TabsContent>
+
+        <TabsContent value="harp" className="outline-none">
+          <HarpOfLightGame />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 };
@@ -1910,18 +3180,27 @@ const JournalPage = ({ entries, setEntries, currentEmotion, user }: any) => {
 
   const saveJournal = async () => {
     if (!text.trim() || !user) return;
-    const newEntry: JournalEntry = {
-      id: Date.now().toString(),
-      timestamp: new Date().toISOString(),
-      text,
-      moodAtTime: currentEmotion || 'neutral'
-    };
-
-    const journalRef = doc(db, 'journals', user.uid);
-    await setDoc(journalRef, { entries: arrayUnion(newEntry) }, { merge: true });
-
-    setText('');
-    toast.success("Journal entry saved successfully.");
+    try {
+      const res = await apiClient.createJournalEntry(text, currentEmotion || 'neutral');
+      if (res.data) {
+        const journalRes = await apiClient.getJournalEntries();
+        if (journalRes.data) {
+          const mappedJournals: JournalEntry[] = (journalRes.data as any[]).map(entry => ({
+            id: entry.id.toString(),
+            timestamp: entry.timestamp,
+            text: entry.text,
+            moodAtTime: entry.mood_at_time as Emotion
+          }));
+          setEntries(mappedJournals);
+        }
+        setText('');
+        toast.success("Journal entry saved successfully.");
+      } else {
+        toast.error(res.error || "Failed to save journal entry.");
+      }
+    } catch (err) {
+      toast.error("Failed to save journal entry.");
+    }
   };
 
   return (
