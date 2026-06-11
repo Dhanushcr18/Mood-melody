@@ -29,6 +29,7 @@ import {
   Search,
   XCircle,
   AlertCircle,
+  Settings,
   ArrowLeft
 } from 'lucide-react';
 import { Button } from "@/components/ui/button";
@@ -175,39 +176,53 @@ const getSongPreview = async (song: Song): Promise<SongPreview | null> => {
 
 const SidebarNav = ({ activeTab, onTabChange }: { activeTab: string, onTabChange: (tab: string) => void }) => {
   const navItems = [
-    { id: 'detect', emoji: '🎭', label: 'Detect Mood' },
-    { id: 'playlist', emoji: '🎶', label: 'My Playlist' },
-    { id: 'lab', emoji: '🧪', label: 'Music Lab' },
-    { id: 'breathing', emoji: '🧘', label: 'Breathing' },
-    { id: 'chat', emoji: '💬', label: 'AI Therapist' },
-    { id: 'journey', emoji: '📊', label: 'My Journey' },
-    { id: 'journal', emoji: '📝', label: 'Mood Journal' },
+    { id: 'detect', icon: <Camera size={20} />, label: 'Detect Mood' },
+    { id: 'playlist', icon: <Music size={20} />, label: 'My Playlist' },
+    { id: 'lab', icon: <Cpu size={20} />, label: 'Music Lab' },
+    { id: 'breathing', icon: <Wind size={20} />, label: 'Relaxation Lounge' },
+    { id: 'chat', icon: <MessageCircle size={20} />, label: 'AI Therapist' },
+    { id: 'journey', icon: <BarChart3 size={20} />, label: 'My Journey' },
+    { id: 'journal', icon: <BookOpen size={20} />, label: 'Mood Journal' },
   ];
 
   return (
-    <nav className="w-20 bg-black/40 border-r border-white/10 flex flex-col items-center py-8 gap-10 hidden md:flex shrink-0">
-      <div className="w-12 h-12 bg-[#4FC3F7] rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(79,195,247,0.4)] cursor-pointer" onClick={() => onTabChange('detect')}>
+    <nav className="w-20 bg-black/40 border-r border-white/10 flex flex-col items-center py-8 gap-8 hidden md:flex shrink-0">
+      <div className="w-12 h-12 bg-[#4FC3F7] rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(79,195,247,0.4)] cursor-pointer hover:scale-105 transition-transform" onClick={() => onTabChange('detect')}>
         <span className="text-2xl">🎵</span>
       </div>
 
-      <div className="flex flex-col gap-8">
+      <div className="flex flex-col gap-6">
         {navItems.map((item) => (
           <button
             key={item.id}
             onClick={() => onTabChange(item.id)}
             title={item.label}
-            className={`p-3 rounded-lg transition-all text-xl ${activeTab === item.id
-              ? 'bg-white/10 text-white opacity-100 shadow-xl'
-              : 'text-white hover:bg-white/5 opacity-60 hover:opacity-100'
+            className={`w-12 h-12 rounded-xl transition-all flex items-center justify-center relative group ${activeTab === item.id
+              ? 'bg-[#4FC3F7]/10 text-[#4FC3F7] border border-[#4FC3F7]/30 shadow-[0_0_15px_rgba(79,195,247,0.15)]'
+              : 'text-white/60 hover:text-white hover:bg-white/5 border border-transparent'
               }`}
           >
-            {item.emoji}
+            {activeTab === item.id && (
+              <motion.div
+                layoutId="activeIndicator"
+                className="absolute left-0 w-1 h-6 bg-[#4FC3F7] rounded-r-full"
+                transition={{ type: "spring", stiffness: 300, damping: 30 }}
+              />
+            )}
+            {item.icon}
           </button>
         ))}
       </div>
 
-      <div className="mt-auto mb-4 p-3 hover:bg-white/5 rounded-lg cursor-pointer opacity-60 hover:opacity-100" onClick={() => onTabChange('settings')}>
-        <span className="text-xl">⚙️</span>
+      <div 
+        className={`w-12 h-12 rounded-xl mt-auto mb-4 transition-all flex items-center justify-center cursor-pointer ${activeTab === 'settings'
+          ? 'bg-[#4FC3F7]/10 text-[#4FC3F7] border border-[#4FC3F7]/30 shadow-[0_0_15px_rgba(79,195,247,0.15)]'
+          : 'text-white/60 hover:text-white hover:bg-white/5 border border-transparent'
+          }`}
+        onClick={() => onTabChange('settings')}
+        title="Settings"
+      >
+        <Settings size={20} />
       </div>
     </nav>
   );
@@ -937,6 +952,13 @@ const DetectPage = ({ onScanStart, onMoodDetected, currentEmotion, confidence, l
                 <div className="absolute bottom-8 right-8 w-4 h-4 border-b-2 border-r-2 border-[#4FC3F7]/40"></div>
               </div>
 
+              {/* Face Guide Target Overlay */}
+              {!isLoading && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
+                  <div className="w-40 h-40 border border-dashed border-[#4FC3F7] rounded-full animate-pulse"></div>
+                </div>
+              )}
+
               {/* Scanning Line UI */}
               {isLoading && (
                 <motion.div
@@ -1088,10 +1110,12 @@ const DetectPage = ({ onScanStart, onMoodDetected, currentEmotion, confidence, l
                 <button
                   key={key}
                   onClick={() => onMoodDetected(key as Emotion, 100)}
-                  className={`flex flex-col items-center justify-center p-2 rounded-xl transition-all border ${currentEmotion === key
-                    ? 'bg-[#4FC3F7]/20 border-[#4FC3F7] shadow-[0_0_10px_#4FC3F733]'
-                    : 'bg-white/5 border-white/5 hover:border-white/20'
-                    }`}
+                  style={{
+                    backgroundColor: currentEmotion === key ? `${config.color}25` : 'rgba(255, 255, 255, 0.02)',
+                    borderColor: currentEmotion === key ? config.color : 'rgba(255, 255, 255, 0.05)',
+                    boxShadow: currentEmotion === key ? `0 0 15px ${config.color}22` : 'none'
+                  }}
+                  className={`flex flex-col items-center justify-center p-2.5 rounded-xl transition-all border hover:scale-[1.03] active:scale-95`}
                 >
                   <span className="text-xl mb-1">{config.emoji}</span>
                   <span className="text-[8px] uppercase font-bold opacity-60">{key}</span>
@@ -2222,11 +2246,29 @@ const SoundBathSoundboard = () => {
             >
               <div className="flex justify-between items-start">
                 <span className="text-3xl">{sound.emoji}</span>
-                <span
-                  className={`text-[8px] font-black uppercase tracking-widest px-3 py-1 rounded-full border ${isActive ? 'bg-[#4FC3F7] text-black border-transparent' : 'text-white/30 border-white/5 bg-white/2 group-hover:text-white/60'}`}
-                >
-                  {isActive ? 'Active' : 'Mute'}
-                </span>
+                <div className="flex items-center gap-3">
+                  {isActive && (
+                    <div className="flex gap-0.5 items-end h-4">
+                      {[...Array(4)].map((_, i) => (
+                        <motion.div
+                          key={i}
+                          animate={{ height: [4, 16, 4] }}
+                          transition={{
+                            repeat: Infinity,
+                            duration: 0.6 + i * 0.15,
+                            ease: "easeInOut"
+                          }}
+                          className="w-0.5 bg-[#4FC3F7] rounded-full"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  <span
+                    className={`text-[8px] font-black uppercase tracking-widest px-3 py-1 rounded-full border ${isActive ? 'bg-[#4FC3F7] text-black border-transparent' : 'text-white/30 border-white/5 bg-white/2 group-hover:text-white/60'}`}
+                  >
+                    {isActive ? 'Active' : 'Mute'}
+                  </span>
+                </div>
               </div>
               <div>
                 <h4 className="font-bold text-lg text-white mb-1 group-hover:text-[#4FC3F7] transition-colors">{sound.name}</h4>
