@@ -207,18 +207,6 @@ npm start
 
 ---
 
-## 📸 Screenshots
-
-- Login Page
-- Dashboard
-- Emotion Detection
-- AI Chat
-- Music Recommendation
-- Journal
-- Mood Analytics
-
----
-
 ## 🔒 Future Enhancements
 
 - Voice Emotion Detection
